@@ -1,0 +1,21 @@
+[package]
+name = "screen-capture"
+version = "0.1.0"
+edition = "2024"
+build = "build.rs"
+
+[lib]
+crate-type = ["cdylib"]
+
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+
+[dependencies]
+windows-capture = "1.5.0"
+rayon = "1.10.0"
+
+[build-dependencies]
+cbindgen = "0.29.0"
