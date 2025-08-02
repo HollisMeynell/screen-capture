@@ -466,24 +466,38 @@ pub fn flip_vertical(data: &mut [u8], width: usize, height: usize) {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use super::*;
+    use core::result::Result;
 
-    static A: AtomicU64 = AtomicU64::new(0);
-
-    fn get_time() -> u64 {
-        let now = std::time::SystemTime::now();
-        let millis = now.duration_since(std::time::UNIX_EPOCH).unwrap();
-        millis.as_millis() as u64
+    #[test]
+    fn text_ffi() -> Result<(), Box<dyn Error>> {
+        let conf = CaptureConfig {
+            audio: false,
+            path: "E:\\d\\xm.mp4".to_string(),
+            width: 0,
+            height: 0,
+            cursor_capture: false,
+            border_draw: false,
+            color_format_rgb8: false,
+            trans_color: false,
+            vertical_flip: false,
+            shared_memory: false,
+            on_frame: None,
+        };
+        let result = start_capture(conf, 1);
+        if result.code != 0 {
+            let s = c_str_to_string(result.error);
+            let err = format!("can not start: {s}");
+            return  Err(err.into());
+        }
+        println!("start to capture");
+        thread::sleep(Duration::from_secs(5));
+        println!("stop to capture");
+        stop_and_free_capture(result.ptr);
+        Ok(())
     }
-
-    fn get_diff() -> u64 {
-        let time = get_time();
-        let before = A.swap(time, Ordering::Relaxed);
-        time - before
-    }
-
-    use std::ptr;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
+    use std::{ptr, thread};
 
     use windows_capture::capture::{Context, GraphicsCaptureApiHandler};
     use windows_capture::encoder::{
@@ -536,10 +550,7 @@ mod tests {
             frame: &mut Frame,
             capture_control: InternalCaptureControl,
         ) -> Result<(), Self::Error> {
-            let n = get_diff();
             let time = frame.timestamp();
-            println!("{n}: {}", time.Duration);
-
             /**/
             let mut buffer = frame.buffer()?;
             let _w = buffer.width() as usize;
