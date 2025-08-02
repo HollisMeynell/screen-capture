@@ -241,6 +241,13 @@ impl GraphicsCaptureApiHandler for Capture {
         self.on_frame(frame)?;
         Ok(())
     }
+
+    fn on_closed(&mut self) -> Result<(), Self::Error> {
+        if let Some(video_encoder) = self.video_encoder.take() {
+            _ = video_encoder.finish();
+        }
+        Ok(())
+    }
 }
 
 /// 枚举显示器列表
@@ -375,11 +382,6 @@ pub extern "C" fn get_shared_memory_ptr(ptr: *mut c_void) -> PointResult {
 pub extern "C" fn stop_and_free_capture(ptr: *mut c_void) {
     let ptr = ptr as *mut SelfCaptureControl;
     let capture_control = unsafe { Box::from_raw(ptr) };
-    let capture = capture_control.callback();
-    let mut capture_mutex = capture.lock();
-    if let Some(video_encoder) = capture_mutex.video_encoder.take() {
-        _ = video_encoder.finish();
-    }
     if !capture_control.is_finished() {
         _ = capture_control.stop();
     }
