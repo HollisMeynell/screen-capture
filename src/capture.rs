@@ -1,11 +1,10 @@
-use crate::{PointResult, StringResult};
+use crate::{CapturePointResult, CaptureStringResult};
 use rayon::prelude::*;
 use std::arch::x86_64::{
     __m256i, _mm256_loadu_si256, _mm256_set_epi8, _mm256_shuffle_epi8, _mm256_storeu_si256,
 };
 use std::error::Error;
-use std::ffi::{c_char, c_void};
-use std::pin::Pin;
+use std::ffi::{CStr, c_char, c_void};
 use std::ptr;
 use windows_capture::capture::{CaptureControl, Context, GraphicsCaptureApiHandler};
 use windows_capture::encoder::{
@@ -25,7 +24,7 @@ type CaptureError = Box<dyn Error + Send + Sync>;
 /// data 为视频帧的字节, 长度为 4 * width * height
 /// width 为宽度
 /// height 为高度
-pub type OnFrame = extern "C" fn(*mut u8, i32, i32);
+pub type OnFrame = extern "C" fn(*const c_void, *mut u8, i32, i32);
 
 /// 枚举显示器列表
 #[repr(C)]
@@ -33,7 +32,7 @@ pub struct MonitorItem {
     pub index: usize,
     pub width: u32,
     pub height: u32,
-    pub name: StringResult,
+    pub name: CaptureStringResult,
 }
 
 /// 枚举显示器列表的打包结构体
@@ -45,7 +44,6 @@ pub struct MonitorItemList {
 
 /// 配置, 宽度高度仅作为, 使用屏幕尺寸
 /// `index` 通过枚举返回的 index 字段
-/// `audio` 是否记录声音, `true` 记录
 /// `path` 录屏保存路径
 /// `cursor_capture` 是否捕获光标, `true` 为捕获
 /// `border_draw` 是否显示屏幕边框, `true` 为显示
@@ -53,28 +51,11 @@ pub struct MonitorItemList {
 /// `trans_color` 回调数据是否处理反转颜色数据中的 r / g 通道 (注意, 此处理消耗大量cpu性能), `true` 反转
 /// `vertical_flip` 回调数据是否反转Y轴(注意, 反转需要 cpu 操作所以尽量使 canvas 绘制操作Y轴反转) `true` 反转
 /// `shared_memory` 是否开启共享内存, `true` 开启
-#[repr(C)]
-pub struct CaptureConfigWithoutCallback {
-    pub index: usize,
-    pub audio: bool,
-    pub path: *const c_char,
-    pub width: u32,
-    pub height: u32,
-    pub cursor_capture: bool,
-    pub border_draw: bool,
-    pub color_format_rgb8: bool,
-    pub trans_color: bool,
-    pub vertical_flip: bool,
-    pub shared_memory: bool,
-}
-
-/// 跟上面一样, 只是多了 on_frame
 /// `on_frame` 回调函数
 #[repr(C)]
 pub struct CaptureConfigWithCallback {
     pub index: usize,
-    pub audio: bool,
-    pub path: *const c_char,
+    pub this_ptr: *const c_void,
     pub width: u32,
     pub height: u32,
     pub cursor_capture: bool,
@@ -83,7 +64,7 @@ pub struct CaptureConfigWithCallback {
     pub trans_color: bool,
     pub vertical_flip: bool,
     pub shared_memory: bool,
-    pub on_frame: OnFrame,
+    pub on_frame: Option<OnFrame>,
 }
 
 /// 配置, 宽度高度仅作为, 使用屏幕尺寸
@@ -94,9 +75,10 @@ pub struct CaptureConfigWithCallback {
 /// `vertical_flip` 回调数据是否反转Y轴(注意, 反转需要 cpu 操作所以尽量使 canvas 绘制操作Y轴反转)
 /// `shared_memory` 是否开启共享内存
 /// `on_frame` 回调函数, 可以是空, 类型为 `OnFrame`
+#[derive(Clone)]
 pub struct CaptureConfig {
-    pub audio: bool,
-    pub path: String,
+    pub index: usize,
+    pub this_ptr: *const c_void,
     pub width: u32,
     pub height: u32,
     pub cursor_capture: bool,
@@ -111,8 +93,8 @@ pub struct CaptureConfig {
 impl From<CaptureConfigWithCallback> for CaptureConfig {
     fn from(config: CaptureConfigWithCallback) -> Self {
         Self {
-            audio: config.audio,
-            path: c_str_to_string(config.path),
+            index: config.index,
+            this_ptr: config.this_ptr,
             width: config.width,
             height: config.height,
             cursor_capture: config.cursor_capture,
@@ -121,45 +103,170 @@ impl From<CaptureConfigWithCallback> for CaptureConfig {
             trans_color: config.trans_color,
             vertical_flip: config.vertical_flip,
             shared_memory: config.shared_memory,
-            on_frame: Some(config.on_frame),
+            on_frame: config.on_frame,
         }
     }
 }
 
-impl From<CaptureConfigWithoutCallback> for CaptureConfig {
-    fn from(config: CaptureConfigWithoutCallback) -> Self {
-        Self {
-            audio: config.audio,
-            path: c_str_to_string(config.path),
-            width: config.width,
-            height: config.height,
-            cursor_capture: config.cursor_capture,
-            border_draw: config.border_draw,
-            color_format_rgb8: config.color_format_rgb8,
-            trans_color: config.trans_color,
-            vertical_flip: config.vertical_flip,
-            shared_memory: config.shared_memory,
-            on_frame: None,
-        }
+impl CaptureConfig {
+    fn trans_to_settings(&mut self) -> Result<Settings<Self, Monitor>, String> {
+        let monitor = if let Ok(mut monitors) = Monitor::enumerate() {
+            let n = monitors
+                .iter()
+                .position(|m| matches!(m.index(), Ok(v) if v == self.index));
+            if let Some(n) = n {
+                monitors.remove(n)
+            } else {
+                return Err("no monitor found".to_string());
+            }
+        } else {
+            return Err("no monitor found".to_string());
+        };
+
+        let width = monitor.width().unwrap_or_default();
+        let height = monitor.height().unwrap_or_default();
+        self.width = width;
+        self.height = height;
+
+        let enable_cursor = if self.cursor_capture {
+            CursorCaptureSettings::WithCursor
+        } else {
+            CursorCaptureSettings::WithoutCursor
+        };
+
+        let enable_border = if self.border_draw {
+            DrawBorderSettings::WithBorder
+        } else {
+            DrawBorderSettings::WithoutBorder
+        };
+
+        let enable_rgba = if self.color_format_rgb8 {
+            ColorFormat::Rgba8
+        } else {
+            ColorFormat::Bgra8
+        };
+
+        let settings = Settings::new(
+            monitor,
+            enable_cursor,
+            enable_border,
+            SecondaryWindowSettings::Default,
+            MinimumUpdateIntervalSettings::Default,
+            DirtyRegionSettings::Default,
+            enable_rgba,
+            self.clone().into(),
+        );
+        Ok(settings)
     }
 }
+
+unsafe impl Send for CaptureConfig {}
+unsafe impl Sync for CaptureConfig {}
 
 fn c_str_to_string(c_str: *const c_char) -> String {
     if c_str.is_null() {
         return "".to_string();
     }
     unsafe {
-        let c_str = std::ffi::CStr::from_ptr(c_str);
+        let c_str = CStr::from_ptr(c_str);
         c_str.to_string_lossy().to_string()
     }
 }
 
-#[repr(C)]
+pub struct CaptureController {
+    handle: Option<CaptureControl<Capture, CaptureError>>,
+    config: CaptureConfig,
+}
+
+impl CaptureController {
+    pub fn new(config: CaptureConfig) -> Self {
+        Self {
+            handle: None,
+            config,
+        }
+    }
+
+    pub fn change_monitor(&mut self, index: usize) -> Result<(), String> {
+        self.config.index = index;
+        self.start_capture()
+    }
+
+    pub fn start_capture(&mut self) -> Result<(), String> {
+        let settings = self.config.trans_to_settings();
+        if let Some(control) = self.handle.take() {
+            if let Err(e) = control.stop() {
+                return Err(e.to_string());
+            }
+        }
+
+        let settings = match settings {
+            Ok(settings) => settings,
+            Err(e) => return Err(e),
+        };
+
+        let handle = match Capture::start_free_threaded(settings) {
+            Ok(control) => control,
+            Err(e) => return Err(e.to_string()),
+        };
+
+        self.handle = Some(handle);
+
+        Ok(())
+    }
+
+    pub fn start_record(&mut self, path: String) -> Result<(), String> {
+        let video_encoder = match VideoEncoder::new(
+            VideoSettingsBuilder::new(self.config.width, self.config.height),
+            AudioSettingsBuilder::default().disabled(true),
+            ContainerSettingsBuilder::default(),
+            path,
+        ) {
+            Ok(encoder) => encoder,
+            Err(e) => {
+                return Err(e.to_string());
+            }
+        };
+
+        let capture = match self.handle.as_ref() {
+            Some(capture) => capture,
+            None => {
+                return Err("capture is not started".to_string());
+            }
+        };
+        let capture = capture.callback();
+        let mut capture = capture.lock();
+        capture.start_record(video_encoder)?;
+        Ok(())
+    }
+
+    pub fn stop_record(&mut self) -> Result<(), String> {
+        let capture = match self.handle.as_ref() {
+            Some(capture) => capture,
+            None => {
+                return Err("capture is not started".to_string());
+            }
+        };
+        let capture = capture.callback();
+        let mut capture = capture.lock();
+        capture.stop_record()?;
+        Ok(())
+    }
+}
+
+impl Drop for CaptureController {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            _ = handle.stop();
+        }
+    }
+}
+
 pub struct Capture {
     pub width: u32,
     pub height: u32,
     pub trans_color: bool,
     pub vertical_flip: bool,
+    pub this_ptr: *const c_void,
     pub video_encoder: Option<VideoEncoder>,
     pub on_frame: Option<OnFrame>,
     pub cache: Option<Vec<u8>>,
@@ -169,6 +276,24 @@ unsafe impl Send for Capture {}
 unsafe impl Sync for Capture {}
 
 impl Capture {
+    fn start_record(&mut self, encoder: VideoEncoder) -> Result<(), String> {
+        if let Some(video_encoder) = self.video_encoder.replace(encoder) {
+            if let Err(e) = video_encoder.finish() {
+                return Err(e.to_string());
+            }
+        }
+        Ok(())
+    }
+
+    fn stop_record(&mut self) -> Result<(), String> {
+        if let Some(video_encoder) = self.video_encoder.take() {
+            if let Err(e) = video_encoder.finish() {
+                return Err(e.to_string());
+            }
+        }
+        Ok(())
+    }
+
     pub fn on_frame(&mut self, frame: &mut Frame) -> Result<(), CaptureError> {
         if self.on_frame.is_none() && self.cache.is_none() {
             return Ok(());
@@ -182,14 +307,19 @@ impl Capture {
             flip_vertical(data, self.width as usize, self.height as usize);
         }
 
+        let ptr;
+
         if let Some(cache) = &mut self.cache {
             let original_ptr = data.as_ptr();
             let cache_ptr = cache.as_mut_ptr();
             unsafe { ptr::copy_nonoverlapping(original_ptr, cache_ptr, data.len()) }
+            ptr = cache_ptr;
+        } else {
+            ptr = data.as_mut_ptr();
         }
 
         if let Some(on_frame) = self.on_frame {
-            on_frame(data.as_mut_ptr(), self.width as i32, self.height as i32);
+            on_frame(self.this_ptr, ptr, self.width as i32, self.height as i32);
         }
         Ok(())
     }
@@ -201,15 +331,8 @@ impl GraphicsCaptureApiHandler for Capture {
     fn new(ctx: Context<Self::Flags>) -> Result<Self, Self::Error> {
         let width = ctx.flags.width;
         let height = ctx.flags.height;
-        let audio = ctx.flags.audio;
-        let path = ctx.flags.path;
-        let video_encoder = VideoEncoder::new(
-            VideoSettingsBuilder::new(width, height),
-            AudioSettingsBuilder::default().disabled(!audio),
-            ContainerSettingsBuilder::default(),
-            path,
-        )?;
-        let video_encoder = Some(video_encoder);
+        let this_ptr = ctx.flags.this_ptr;
+        let video_encoder = None;
         let trans_color = ctx.flags.trans_color;
         let vertical_flip = ctx.flags.vertical_flip;
         let on_frame = ctx.flags.on_frame;
@@ -222,6 +345,7 @@ impl GraphicsCaptureApiHandler for Capture {
         Ok(Self {
             width,
             height,
+            this_ptr,
             trans_color,
             video_encoder,
             vertical_flip,
@@ -244,7 +368,7 @@ impl GraphicsCaptureApiHandler for Capture {
 
     fn on_closed(&mut self) -> Result<(), Self::Error> {
         if let Some(video_encoder) = self.video_encoder.take() {
-            _ = video_encoder.finish();
+            video_encoder.finish()?;
         }
         Ok(())
     }
@@ -263,7 +387,7 @@ pub extern "C" fn enumerate_monitor() -> MonitorItemList {
                     index,
                     width,
                     height,
-                    name: StringResult::new(name),
+                    name: CaptureStringResult::new(name),
                 }),
                 _ => continue,
             };
@@ -291,106 +415,69 @@ pub extern "C" fn free_enumerate_monitor(list: MonitorItemList) {
     }
 }
 
-/// 开始采集, 使用回调函数
+/// 创建采集器, 使用回调函数
 #[unsafe(no_mangle)]
-pub extern "C" fn start_capture_with_callback(config: CaptureConfigWithCallback) -> PointResult {
-    let monitor_index = config.index;
-    start_capture(config.into(), monitor_index)
-}
-
-/// 开始采集, **不使用** 回调函数
-#[unsafe(no_mangle)]
-pub extern "C" fn start_capture_without_callback(
-    config: CaptureConfigWithoutCallback,
-) -> PointResult {
-    let monitor_index = config.index;
-    start_capture(config.into(), monitor_index)
-}
-
-fn start_capture(mut config: CaptureConfig, monitor_index: usize) -> PointResult {
-    let monitor = if let Ok(mut monitors) = Monitor::enumerate() {
-        let n = monitors
-            .iter()
-            .position(|m| matches!(m.index(), Ok(v) if v == monitor_index));
-        if let Some(n) = n {
-            monitors.remove(n)
-        } else {
-            return PointResult::error("no monitor found");
-        }
-    } else {
-        return PointResult::error("no monitor found");
-    };
-    let width = monitor.width().unwrap_or_default();
-    let height = monitor.height().unwrap_or_default();
-    config.width = width;
-    config.height = height;
-
-    let enable_cursor = if config.cursor_capture {
-        CursorCaptureSettings::WithCursor
-    } else {
-        CursorCaptureSettings::WithoutCursor
-    };
-
-    let enable_border = if config.border_draw {
-        DrawBorderSettings::WithBorder
-    } else {
-        DrawBorderSettings::WithoutBorder
-    };
-
-    let enable_rgba = if config.color_format_rgb8 {
-        ColorFormat::Rgba8
-    } else {
-        ColorFormat::Bgra8
-    };
-    let settings = Settings::new(
-        monitor,
-        enable_cursor,
-        enable_border,
-        SecondaryWindowSettings::Default,
-        MinimumUpdateIntervalSettings::Default,
-        DirtyRegionSettings::Default,
-        enable_rgba,
-        config.into(),
-    );
-    match Capture::start_free_threaded(settings) {
-        Ok(data) => PointResult::create(data),
-        Err(err) => PointResult::error(err.to_string()),
+pub extern "C" fn create_capture(config: CaptureConfigWithCallback) -> CapturePointResult {
+    let mut controller = CaptureController::new(config.into());
+    match controller.start_capture() {
+        Ok(_) => CapturePointResult::create(controller),
+        Err(e) => CapturePointResult::error(e),
     }
 }
-type SelfCaptureControl = CaptureControl<Capture, CaptureError>;
 
-/// 获取共享内存指针
 #[unsafe(no_mangle)]
-pub extern "C" fn get_shared_memory_ptr(ptr: *mut c_void) -> PointResult {
-    let capture = match get_capture_handle(ptr) {
+pub extern "C" fn change_capture(ptr: *mut c_void, index: usize) -> CaptureStringResult {
+    let capture_controller = match get_capture_handle(ptr) {
         Some(capture) => capture,
-        None => return PointResult::error("point error"),
+        None => return CaptureStringResult::throw("point error"),
     };
 
-    let capture = capture.callback();
-    let obj = capture.lock();
-    if let Some(ref cache) = obj.cache {
-        let pinned: Pin<&Vec<u8>> = Pin::new(cache);
-        PointResult::create_ptr(pinned.as_ptr() as *mut c_void)
+    match capture_controller.change_monitor(index) {
+        Ok(_) => CaptureStringResult::null(),
+        Err(e) => CaptureStringResult::throw(e),
+    }
+}
+
+/// 开始采集
+#[unsafe(no_mangle)]
+pub extern "C" fn start_record_mp4(ptr: *mut c_void, path: *const c_char) -> CaptureStringResult {
+    let capture_controller = match get_capture_handle(ptr) {
+        Some(capture) => capture,
+        None => return CaptureStringResult::throw("point error"),
+    };
+    let path = c_str_to_string(path);
+    match capture_controller.start_record(path) {
+        Ok(_) => CaptureStringResult::null(),
+        Err(e) => CaptureStringResult::throw(e),
+    }
+}
+
+/// 停止采集
+#[unsafe(no_mangle)]
+pub extern "C" fn stop_record_mp4(ptr: *mut c_void) -> CaptureStringResult {
+    let capture_controller = match get_capture_handle(ptr) {
+        Some(capture) => capture,
+        None => return CaptureStringResult::throw("point error"),
+    };
+    if let Err(e) = capture_controller.stop_record() {
+        CaptureStringResult::throw(e)
     } else {
-        PointResult::null()
+        CaptureStringResult::null()
     }
 }
 
 /// 记得释放控制器
 #[unsafe(no_mangle)]
 pub extern "C" fn stop_and_free_capture(ptr: *mut c_void) {
-    let ptr = ptr as *mut SelfCaptureControl;
-    let capture_control = unsafe { Box::from_raw(ptr) };
-    if !capture_control.is_finished() {
-        _ = capture_control.stop();
-    }
+    let ptr = ptr as *mut CaptureController;
+    unsafe { let _ = Box::from_raw(ptr); }
 }
 
 #[inline(always)]
-fn get_capture_handle(ptr: *mut c_void) -> Option<&'static mut SelfCaptureControl> {
-    unsafe { (ptr as *mut SelfCaptureControl).as_mut() }
+fn get_capture_handle(ptr: *mut c_void) -> Option<&'static mut CaptureController> {
+    unsafe { (ptr as *mut CaptureController).as_mut() }
 }
+
 /*
 pub fn trans_color(data: &mut [u8]) {
     // 转换 rgba <-> bgra
@@ -471,9 +558,9 @@ mod tests {
 
     #[test]
     fn text_ffi() -> Result<(), Box<dyn Error>> {
-        let conf = CaptureConfig {
-            audio: false,
-            path: "E:\\d\\xm.mp4".to_string(),
+        let conf = CaptureConfigWithCallback {
+            index: 1,
+            this_ptr: 0 as *const c_void,
             width: 0,
             height: 0,
             cursor_capture: false,
@@ -484,21 +571,24 @@ mod tests {
             shared_memory: false,
             on_frame: None,
         };
-        let result = start_capture(conf, 1);
+        let result = create_capture(conf);
         if result.code != 0 {
             let s = c_str_to_string(result.error);
             let err = format!("can not start: {s}");
-            return  Err(err.into());
+            return Err(err.into());
         }
+        let ptr = result.ptr;
         println!("start to capture");
+        let path = CString::new("D:\\test.mp4").unwrap();
+        start_record_mp4(ptr, path.as_ptr());
         thread::sleep(Duration::from_secs(5));
         println!("stop to capture");
         stop_and_free_capture(result.ptr);
         Ok(())
     }
+    use std::ffi::CString;
     use std::time::{Duration, Instant};
     use std::{ptr, thread};
-
     use windows_capture::capture::{Context, GraphicsCaptureApiHandler};
     use windows_capture::encoder::{
         AudioSettingsBuilder, ContainerSettingsBuilder, VideoEncoder, VideoSettingsBuilder,

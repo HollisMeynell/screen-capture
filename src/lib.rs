@@ -7,13 +7,13 @@ use std::ptr::{null, null_mut};
 /// `code`: 返回 code 协议: 0 正常, -1 null, -2 error(带信息), -3 trouble(无法获取异常信息)
 /// `data`: 可能为空的字符串指针, 如果 `code == -2` 则 data 为异常信息
 #[repr(C)]
-pub struct StringResult {
+pub struct CaptureStringResult {
     pub code: i32,
     pub data: *const c_char,
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn free_string_result(s: StringResult) {
+pub extern "C" fn free_string_result(s: CaptureStringResult) {
     free_string(s.data)
 }
 
@@ -27,7 +27,7 @@ pub extern "C" fn free_string(s: *const c_char) {
     }
 }
 
-impl StringResult {
+impl CaptureStringResult {
     pub fn new<T: Into<Vec<u8>>>(data: T) -> Self {
         let (data, code): (*const c_char, i32) = match CString::new(data) {
             Ok(s) => (s.into_raw(), 0),
@@ -55,13 +55,13 @@ impl StringResult {
 /// `code`: 返回 code 协议: 0 正常, -1 null, -2 error(带信息), -3 trouble(无法获取异常信息)
 /// `error`: 异常信息指针, 可能为空
 #[repr(C)]
-pub struct PointResult {
+pub struct CapturePointResult {
     pub ptr: *mut c_void,
     pub code: i32,
     pub error: *const c_char,
 }
 
-impl PointResult {
+impl CapturePointResult {
     pub fn null() -> Self {
         Self {
             ptr: null_mut(),
