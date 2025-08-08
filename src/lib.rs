@@ -2,6 +2,19 @@ mod capture;
 
 use std::ffi::{CString, c_char, c_void};
 use std::ptr::{null, null_mut};
+use std::sync::atomic::AtomicBool;
+use std::time::Instant;
+use windows_capture::capture::{Context, GraphicsCaptureApiError, GraphicsCaptureApiHandler};
+use windows_capture::encoder::{
+    AudioSettingsBuilder, ContainerSettingsBuilder, VideoEncoder, VideoSettingsBuilder,
+};
+use windows_capture::frame::Frame;
+use windows_capture::graphics_capture_api::{Error, InternalCaptureControl};
+use windows_capture::monitor::Monitor;
+use windows_capture::settings::{
+    ColorFormat, CursorCaptureSettings, DirtyRegionSettings, DrawBorderSettings,
+    MinimumUpdateIntervalSettings, SecondaryWindowSettings, Settings,
+};
 
 /// 封装的字符串结果
 /// `code`: 返回 code 协议: 0 正常, -1 null, -2 error(带信息), -3 trouble(无法获取异常信息)
@@ -96,6 +109,113 @@ impl CapturePointResult {
             ptr,
             code: 0,
             error: null(),
+        }
+    }
+}
+
+struct TestCapture {
+    encoder: Option<VideoEncoder>,
+    start: Instant,
+}
+
+impl GraphicsCaptureApiHandler for TestCapture {
+    type Flags = (u32, u32);
+    type Error = ();
+
+    fn new(ctx: Context<Self::Flags>) -> Result<Self, Self::Error> {
+        let encoder = VideoEncoder::new(
+            VideoSettingsBuilder::new(ctx.flags.0, ctx.flags.1),
+            AudioSettingsBuilder::default().disabled(true),
+            ContainerSettingsBuilder::default(),
+            "video.mp4",
+        )
+        .unwrap();
+        Ok(Self {
+            encoder: Some(encoder),
+            start: Instant::now(),
+        })
+    }
+
+    fn on_frame_arrived(
+        &mut self,
+        frame: &mut Frame,
+        capture_control: InternalCaptureControl,
+    ) -> Result<(), Self::Error> {
+        self.encoder.as_mut().unwrap().send_frame(frame).unwrap();
+        if self.start.elapsed().as_secs() >= 10 {
+            // 完成编码器并保存视频
+            self.encoder.take().unwrap().finish().unwrap();
+            capture_control.stop();
+        }
+        Ok(())
+    }
+}
+
+fn main() {
+    static UNSUPPORT_CURSOR:AtomicBool = AtomicBool::new(false);
+    static UNSUPPORT_BORDER:AtomicBool = AtomicBool::new(false);
+
+    let mut list = match Monitor::enumerate() {
+        Ok(list) => list,
+        Err(e) => panic!("{}", e),
+    };
+    if list.is_empty() {
+        panic!("No monitors found.");
+    };
+    let first_monitor = list.remove(0);
+    let w = first_monitor.width().unwrap_or(0);
+    let h = first_monitor.height().unwrap_or(0);
+    loop {
+        let cursor_conf = if UNSUPPORT_CURSOR.load(std::sync::atomic::Ordering::SeqCst) {
+            CursorCaptureSettings::Default
+        } else {
+            CursorCaptureSettings::WithoutCursor
+        };
+
+        let border_conf = if UNSUPPORT_BORDER.load(std::sync::atomic::Ordering::SeqCst) {
+            DrawBorderSettings::Default
+        } else {
+            DrawBorderSettings::WithoutBorder
+        };
+        let settings = Settings::new(
+            // 要捕获的项
+            first_monitor,
+            // 光标捕获设置
+            cursor_conf,
+            // 绘制边框设置
+            border_conf,
+            // 次要窗口设置，如果你想在捕获中包含次要窗口
+            SecondaryWindowSettings::Default,
+            // 最小更新间隔，如果你想更改帧率限制（默认为60 FPS或16.67毫秒）
+            MinimumUpdateIntervalSettings::Default,
+            // 脏区域设置
+            DirtyRegionSettings::Default,
+            // 捕获帧所需的颜色格式
+            ColorFormat::Bgra8,
+            // 捕获设置的附加标志，将传递给用户定义的 `new` 函数
+            (w, h),
+        );
+
+        let start = TestCapture::start(settings);
+        if start.is_ok() {
+            break;
+        }
+
+        match start {
+
+            Err(GraphicsCaptureApiError::GraphicsCaptureApiError(e)) => match e {
+                Error::CursorConfigUnsupported => {
+                    UNSUPPORT_CURSOR.store(true, std::sync::atomic::Ordering::SeqCst)
+                }
+                Error::BorderConfigUnsupported => {
+                    UNSUPPORT_BORDER.store(true, std::sync::atomic::Ordering::SeqCst)
+                }
+                _ => {
+                    panic!("{}", e);
+                }
+            }
+            Err(e) => panic!("{:?}", e),
+            _ => return,
         }
     }
 }

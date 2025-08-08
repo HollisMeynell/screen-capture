@@ -6,7 +6,8 @@ use std::arch::x86_64::{
 use std::error::Error;
 use std::ffi::{CStr, c_char, c_void};
 use std::ptr;
-use windows_capture::capture::{CaptureControl, Context, GraphicsCaptureApiHandler};
+use std::sync::atomic::{AtomicBool, Ordering};
+use windows_capture::capture::{CaptureControl, Context, GraphicsCaptureApiError, GraphicsCaptureApiHandler};
 use windows_capture::encoder::{
     AudioSettingsBuilder, ContainerSettingsBuilder, VideoEncoder, VideoSettingsBuilder,
 };
@@ -17,6 +18,10 @@ use windows_capture::settings::{
     ColorFormat, CursorCaptureSettings, DirtyRegionSettings, DrawBorderSettings,
     MinimumUpdateIntervalSettings, SecondaryWindowSettings, Settings,
 };
+
+static UNSUPPORTED_CURSOR: AtomicBool = AtomicBool::new(false);
+
+static UNSUPPORTED_BORDER: AtomicBool = AtomicBool::new(false);
 
 type CaptureError = Box<dyn Error + Send + Sync>;
 
@@ -128,13 +133,17 @@ impl CaptureConfig {
         self.width = width;
         self.height = height;
 
-        let enable_cursor = if self.cursor_capture {
+        let enable_cursor = if UNSUPPORTED_CURSOR.load(Ordering::SeqCst) {
+            CursorCaptureSettings::Default
+        } else if self.cursor_capture {
             CursorCaptureSettings::WithCursor
         } else {
             CursorCaptureSettings::WithoutCursor
         };
 
-        let enable_border = if self.border_draw {
+        let enable_border = if UNSUPPORTED_BORDER.load(Ordering::SeqCst) {
+            DrawBorderSettings::Default
+        } else if self.border_draw {
             DrawBorderSettings::WithBorder
         } else {
             DrawBorderSettings::WithoutBorder
@@ -192,21 +201,29 @@ impl CaptureController {
     }
 
     pub fn start_capture(&mut self) -> Result<(), String> {
-        let settings = self.config.trans_to_settings();
-        if let Some(control) = self.handle.take() {
-            if let Err(e) = control.stop() {
-                return Err(e.to_string());
+        let handle = loop {
+            let settings = self.config.trans_to_settings();
+            if let Some(control) = self.handle.take() {
+                if let Err(e) = control.stop() {
+                    return Err(e.to_string());
+                }
             }
-        }
 
-        let settings = match settings {
-            Ok(settings) => settings,
-            Err(e) => return Err(e),
-        };
+            let settings = match settings {
+                Ok(settings) => settings,
+                Err(e) => return Err(e),
+            };
 
-        let handle = match Capture::start_free_threaded(settings) {
-            Ok(control) => control,
-            Err(e) => return Err(e.to_string()),
+            match Capture::start_free_threaded(settings) {
+                Ok(control) => break control,
+                Err(GraphicsCaptureApiError::GraphicsCaptureApiError(windows_capture::graphics_capture_api::Error::CursorConfigUnsupported)) => {
+                    UNSUPPORTED_CURSOR.store(true, Ordering::SeqCst)
+                }
+                Err(GraphicsCaptureApiError::GraphicsCaptureApiError(windows_capture::graphics_capture_api::Error::BorderConfigUnsupported)) => {
+                    UNSUPPORTED_BORDER.store(true, Ordering::SeqCst)
+                }
+                Err(e) => return Err(e.to_string()),
+            };
         };
 
         self.handle = Some(handle);
@@ -359,10 +376,10 @@ impl GraphicsCaptureApiHandler for Capture {
         frame: &mut Frame,
         _: InternalCaptureControl,
     ) -> Result<(), Self::Error> {
+        self.on_frame(frame)?;
         if let Some(video_encoder) = self.video_encoder.as_mut() {
             video_encoder.send_frame(frame)?;
         }
-        self.on_frame(frame)?;
         Ok(())
     }
 
@@ -615,7 +632,7 @@ mod tests {
         type Flags = String;
 
         // `CaptureControl` 和 `start` 函数可能返回的错误类型
-        type Error = Box<dyn std::error::Error + Send + Sync>;
+        type Error = Box<dyn Error + Send + Sync>;
 
         // 创建新实例的函数。标志可以从设置中传递。
         fn new(ctx: Context<Self::Flags>) -> Result<Self, Self::Error> {
