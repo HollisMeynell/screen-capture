@@ -163,7 +163,7 @@ impl CaptureConfig {
             MinimumUpdateIntervalSettings::Default,
             DirtyRegionSettings::Default,
             enable_rgba,
-            self.clone().into(),
+            self.clone(),
         );
         Ok(settings)
     }
@@ -209,10 +209,7 @@ impl CaptureController {
                 }
             }
 
-            let settings = match settings {
-                Ok(settings) => settings,
-                Err(e) => return Err(e),
-            };
+            let settings = settings?;
 
             match Capture::start_free_threaded(settings) {
                 Ok(control) => break control,
@@ -577,7 +574,7 @@ mod tests {
     fn text_ffi() -> Result<(), Box<dyn Error>> {
         let conf = CaptureConfigWithCallback {
             index: 1,
-            this_ptr: 0 as *const c_void,
+            this_ptr: ptr::null::<c_void>(),
             width: 0,
             height: 0,
             cursor_capture: false,
